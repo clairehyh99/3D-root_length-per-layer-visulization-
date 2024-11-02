@@ -6,6 +6,9 @@ library(dplyr)
 library(data.table)
 library(htmlwidgets)
 library(RColorBrewer)
+library(lme4)
+library(emmeans)
+library(ggtext)
 setwd("/data/gpfs/projects/punim1869/users/yunhongh1/workspace/intergrain/NARO_3D/CT_cb/rinfo")
 # json xyz - polylines
 extract_polylines <- function(data, polylines_list) {
@@ -183,3 +186,233 @@ ggplot(final_data_table, aes(x = depth_numeric, y = cumulative_length, color = g
   facet_wrap(~ condition) +
   scale_color_manual(values = c("Vlamingh" = "#F9766D", "Buff" = "#7DAF00", "Roe" = "#00C6CC", "LaTrobe" = "#BD77F2")) +
   scale_x_continuous(breaks = seq(0.66, max(final_data_table$depth_numeric, na.rm = TRUE), by = 0.66))
+
+#Stats
+##lmm
+lmm_interaction <- lmer(total_length ~ genotype * condition * depth_layer + (1 | replicate), data = final_data_table)
+final_data_table$predict_total_length <- predict(lmm_interaction)
+wide_data <- final_data_table %>%
+  pivot_wider(names_from = depth_layer, values_from = c(total_length, cumulative_length, predict_total_length))
+write.table(wide_data, "length_per_layer.txt", quote = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+##Multiple comparison
+est_by_factor <- emmeans(lmm_interaction, pairwise ~ genotype * condition * depth_layer)
+contrasts_diff_genotype_same_condition_same_layer <- contrast(est_by_factor, method = "pairwise", by = c("condition", "depth_layer"))
+contrasts_diff_genotype_same_condition_same_layer_results <- summary(contrasts_diff_genotype_same_condition_same_layer)
+contrasts_same_genotype_diff_condition_same_layer <- contrast(est_by_factor, method = "pairwise", by = c("genotype", "depth_layer"))
+contrasts_same_genotype_diff_condition_same_layer_results <- summary(contrasts_same_genotype_diff_condition_same_layer)
+##LASSO
+data <- fread("/data/gpfs/projects/punim1869/users/yunhongh1/workspace/intergrain/NARO_3D/D2.txt") #deficient
+data <- fread("/data/gpfs/projects/punim1869/users/yunhongh1/workspace/intergrain/NARO_3D/S2.txt") #surplus
+data <- as.data.frame(data)
+above_ground_traits <- c("Shootdryweight", "NofT", "CN", "N_content") #maybe add C% or N%? 
+X <- as.matrix(data[, above_ground_traits])
+root_traits <- grep("total_length_", names(data), value = TRUE)
+for (root_trait in root_traits) {
+  Y <- data[[root_trait]]  # Now Y is a root trait
+  # LOOCV 
+  lasso_model <- cv.glmnet(X, Y, alpha = 1, nfolds = nrow(X))
+  best_lambda <- lasso_model$lambda.min
+  
+  coefficients <- coef(lasso_model, s = best_lambda)
+  important_vars <- data.frame(Variable = rownames(coefficients), Coefficient = coefficients[, 1])
+  
+  important_vars <- important_vars[important_vars$Coefficient != 0, ]
+  important_vars <- important_vars[important_vars$Variable != "(Intercept)", ]
+  
+  selected_vars <- colnames(X)[colnames(X) %in% important_vars$Variable]
+  
+  if (length(selected_vars) > 1) {  # If we have more than 1 important variable
+    
+    # Pearson
+    correlation_results <- rcorr(as.matrix(data[, selected_vars]), Y)
+    corr_matrix <- correlation_results$r
+    p_matrix <- correlation_results$P
+    
+    diag(p_matrix) <- NA
+    
+    p_matrix_significance <- p_matrix
+    p_matrix_significance[p_matrix < 0.01] <- '**'
+    p_matrix_significance[p_matrix >= 0.01 & p_matrix < 0.05] <- '*'
+    p_matrix_significance[p_matrix >= 0.05] <- ''
+    
+    print(p_matrix_significance)
+    
+    for (var in selected_vars) {
+      df_plot <- data.frame(AboveGroundTrait = data[[var]], RootTrait = Y)
+      
+      significance_label <- as.character(p_matrix_significance[var, "y"]) 
+      
+      lm_fit <- lm(RootTrait ~ AboveGroundTrait, data = df_plot)
+      intercept <- coef(lm_fit)[1]
+      slope <- coef(lm_fit)[2]
+      equation <- paste0("y = ", round(intercept, 2), " + ", round(slope, 2), "*x")
+      
+      equation_with_significance <- paste0(
+        ifelse(significance_label != "", 
+               paste0("<span style='color:red;'>", significance_label, "</span> "), ""),
+        equation)
+      
+      p <- ggplot(df_plot, aes(x = AboveGroundTrait, y = RootTrait)) +
+        geom_point(size = 3, color = "blue") +  
+        geom_smooth(method = "lm", se = TRUE, color = "black", linetype = "solid") +  
+        labs(title = paste("Regression Line for", root_trait, "and", var, "with significance"),
+             x = var, y = root_trait) +
+        geom_richtext(aes(x = Inf, y = min(df_plot$RootTrait), 
+                          label = equation_with_significance), hjust = 1.2, vjust = -1.2, size = 6, fill = NA, label.color = NA) +  
+        theme_minimal()
+      
+      print(p)
+      
+      # Save
+      filename <- paste0("regression_plot_", var, "_vs_", root_trait, ".png")
+      ggsave(filename = filename, plot = p, width = 8, height = 6)
+    }
+    
+  } else {
+    message(paste("No important variable for root trait:", root_trait))
+  }
+}
+##plot all
+for (root_trait in root_traits) {
+  Y <- data[[root_trait]]  # Now Y is a root trait
+  
+  # LOOCV 
+  lasso_model <- cv.glmnet(X, Y, alpha = 1, nfolds = nrow(X))
+  best_lambda <- lasso_model$lambda.min
+  
+  coefficients <- coef(lasso_model, s = best_lambda)
+  important_vars <- data.frame(Variable = rownames(coefficients), Coefficient = coefficients[, 1])
+  
+  important_vars <- important_vars[important_vars$Coefficient != 0, ]
+  important_vars <- important_vars[important_vars$Variable != "(Intercept)", ]
+  
+  selected_vars <- colnames(X)[colnames(X) %in% important_vars$Variable]
+  
+  # Check if important variables were selected
+  if (length(selected_vars) > 1) {  
+    # Code for plotting with significance, as before
+    
+    correlation_results <- rcorr(as.matrix(data[, selected_vars]), Y)
+    corr_matrix <- correlation_results$r
+    p_matrix <- correlation_results$P
+    
+    diag(p_matrix) <- NA
+    
+    p_matrix_significance <- p_matrix
+    p_matrix_significance[p_matrix < 0.01] <- '**'
+    p_matrix_significance[p_matrix >= 0.01 & p_matrix < 0.05] <- '*'
+    p_matrix_significance[p_matrix >= 0.05] <- ''
+    
+    print(p_matrix_significance)
+    
+    for (var in selected_vars) {
+      df_plot <- data.frame(AboveGroundTrait = data[[var]], RootTrait = Y)
+      
+      significance_label <- as.character(p_matrix_significance[var, "y"]) 
+      
+      lm_fit <- lm(RootTrait ~ AboveGroundTrait, data = df_plot)
+      intercept <- coef(lm_fit)[1]
+      slope <- coef(lm_fit)[2]
+      equation <- paste0("y = ", round(intercept, 2), " + ", round(slope, 2), "*x")
+      
+      equation_with_significance <- paste0(
+        ifelse(significance_label != "", 
+               paste0("<span style='color:red;'>", significance_label, "</span> "), ""),
+        equation)
+      
+      p <- ggplot(df_plot, aes(x = AboveGroundTrait, y = RootTrait)) +
+        geom_point(size = 3, color = "blue") +  
+        geom_smooth(method = "lm", se = TRUE, color = "black", linetype = "solid") +  
+        labs(title = paste("Regression Line for", root_trait, "and", var),
+             x = var, y = root_trait) +
+        geom_richtext(aes(x = Inf, y = min(df_plot$RootTrait), 
+                          label = equation_with_significance), hjust = 1.2, vjust = -1.2, size = 6, fill = NA, label.color = NA) +  
+        theme_minimal()
+      
+      print(p)
+      
+      # Save
+      filename <- paste0("regression_plot_", var, "_vs_", root_trait, ".png")
+      ggsave(filename = filename, plot = p, width = 8, height = 6)
+    }
+    
+  } else {  
+    message(paste("Not important variable for root trait:", root_trait))
+
+##Alternative way - plot as forest plot showing coefficients
+root_depth_layers <- grep("total_length_", names(data), value = TRUE)
+depth_levels <- paste0("total_length_", c("[638,660]", "[616,638)", "[594,616)", "[572,594)", "[550,572)", 
+                                          "[528,550)", "[506,528)", "[484,506)", "[462,484)", "[440,462)", 
+                                          "[418,440)", "[396,418)", "[374,396)", "[352,374)", "[330,352)", 
+                                          "[308,330)", "[286,308)", "[264,286)", "[242,264)", "[220,242)", 
+                                          "[198,220)", "[176,198)", "[154,176)", "[132,154)", "[110,132)", 
+                                          "[88,110)", "[66,88)", "[44,66)", "[22,44)", "[0,22)"))
+
+results_df <- data.frame(
+  DepthLayer = depth_levels,
+  Variable = NA,
+  Coefficient = 0,
+  Importance = "Not Important",
+  Significance = "Not Significant"
+)
+for (root_trait in root_depth_layers) {
+  Y <- data[[root_trait]]  # Current soil depth layer
+  
+  # LASSO with LOOCV
+  lasso_model <- cv.glmnet(X, Y, alpha = 1, nfolds = nrow(X))
+  best_lambda <- lasso_model$lambda.min
+  coefficients <- coef(lasso_model, s = best_lambda)
+  important_vars <- data.frame(Variable = rownames(coefficients), Coefficient = as.vector(coefficients[, 1]))
+  important_vars <- important_vars[important_vars$Variable != "(Intercept)", ]
+  
+  if (nrow(important_vars[important_vars$Coefficient != 0, ]) > 0) {
+    for (var in important_vars$Variable[important_vars$Coefficient != 0]) {
+      corr_test <- rcorr(data[[var]], Y)
+      p_value <- corr_test$P[1, 2]
+      
+      results_df <- rbind(results_df, data.frame(
+        DepthLayer = root_trait,
+        Variable = var,
+        Coefficient = important_vars$Coefficient[important_vars$Variable == var],
+        Importance = "Important",
+        Significance = ifelse(p_value < 0.05, "Significant", "Not Significant")
+      ))
+    }
+  }
+}
+
+results_df <- results_df[!(duplicated(results_df$DepthLayer) & results_df$Coefficient == 0), ]
+
+# order depth
+results_df$DepthLayer <- factor(results_df$DepthLayer, levels = depth_levels)
+depth_labels <- paste0(seq(19.8, by = -0.66, length.out = length(depth_levels)), "-", 
+                       seq(20.46, by = -0.66, length.out = length(depth_levels)))
+
+# plot
+forest_plot <- ggplot(results_df, aes(x = DepthLayer, y = Coefficient)) +
+  geom_point(aes(color = interaction(Importance, Significance)), size = 3) +
+  geom_text(aes(label = Variable), vjust = -0.5, size = 3) +  # Add trait labels above coefficient
+  geom_errorbar(aes(ymin = Coefficient - 0.05, ymax = Coefficient + 0.05), width = 0.2) +
+  scale_color_manual(values = c(
+    "Important.Significant" = "red",
+    "Important.Not Significant" = "black",
+    "Not Important.Significant" = "blue",
+    "Not Important.Not Significant" = "grey"
+  )) +
+  scale_x_discrete(labels = depth_labels) +
+  labs(title = "Forest Plot of LASSO Coefficients Across Soil Depth Layers",
+       x = "Soil Depth Layer",
+       y = "Coefficient") +
+  theme_minimal() +
+  coord_flip()
+
+print(forest_plot)
+
+
+
+
+
+
+
+
+
